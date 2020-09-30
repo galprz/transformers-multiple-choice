@@ -1,13 +1,19 @@
 import os
-from typing import Optional, Union, Dict, Any
+import warnings
+from typing import Optional, Union, Dict, Any, List
 import numpy as np
 from torch.utils.data import DataLoader, DistributedSampler
 from tqdm import trange
 from transformers import set_seed, is_apex_available, logger
-from transformers.trainer import torch, Trainer
-from transformers.trainer_utils import EvaluationStrategy, HPSearchBackend, TrainOutput
-from tqdm import tqdm_notebook as tqdm
-
+from transformers.trainer import torch, Trainer, EvalPrediction
+from transformers.trainer_utils import EvaluationStrategy, HPSearchBackend, TrainOutput, PredictionOutput, \
+    nested_concat, distributed_concat, nested_numpify, distributed_broadcast_scalars
+from tqdm import tqdm as tqdm_base
+def tqdm(*args, **kwargs):
+    if hasattr(tqdm_base, '_instances'):
+        for instance in list(tqdm_base._instances):
+            tqdm_base._decr_instances(instance)
+    return tqdm_base(*args, **kwargs)
 
 class MyTrainer(Trainer):
     def train(self, model_path: Optional[str] = None, trial: Union["optuna.Trial", Dict[str, Any]] = None):
@@ -127,7 +133,7 @@ class MyTrainer(Trainer):
             # Reset the past mems state at the beginning of each epoch if necessary.
             if self.args.past_index >= 0:
                 self._past = None
-
+            epoch_number = 0
             epoch_pbar = tqdm(epoch_iterator, desc="Iteration", disable=disable_tqdm)
             for step, inputs in enumerate(epoch_iterator):
 
@@ -173,28 +179,7 @@ class MyTrainer(Trainer):
                         metrics = self.evaluate()
                         self._report_to_hp_search(trial, epoch, metrics)
 
-                    if self.args.save_steps > 0 and self.global_step % self.args.save_steps == 0:
-                        # In all cases (even distributed/parallel), self.model is always a reference
-                        # to the model we want to save.
-                        if hasattr(model, "module"):
-                            assert (
-                                    model.module is self.model
-                            ), f"Module {model.module} should be a reference to self.model"
-                        else:
-                            assert model is self.model, f"Model {model} should be a reference to self.model"
-                        # Save model checkpoint
-                        checkpoint_folder = f"checkpoints-{self.global_step}"
 
-                        output_dir = os.path.join(self.args.output_dir, checkpoint_folder)
-
-                        self.save_model(output_dir)
-
-                        if self.is_world_process_zero():
-                            self._rotate_checkpoints(use_mtime=True)
-
-
-                        torch.save(self.optimizer.state_dict(), os.path.join(output_dir, "optimizer.pt"))
-                        torch.save(self.lr_scheduler.state_dict(), os.path.join(output_dir, "scheduler.pt"))
 
                 epoch_pbar.update(1)
                 if self.args.evaluation_strategy == EvaluationStrategy.EPOCH:
@@ -204,6 +189,29 @@ class MyTrainer(Trainer):
                     break
             epoch_pbar.close()
             train_pbar.update(1)
+            metrics = self.evaluate()
+            self._report_to_hp_search(trial, epoch, metrics)
+            # In all cases (even distributed/parallel), self.model is always a reference
+            # to the model we want to save.
+            if hasattr(model, "module"):
+                assert (
+                        model.module is self.model
+                ), f"Module {model.module} should be a reference to self.model"
+            else:
+                assert model is self.model, f"Model {model} should be a reference to self.model"
+            # Save model checkpoint
+            epoch_number += 1
+            checkpoint_folder = f"checkpoints-epoch-{epoch_number}"
+
+            output_dir = os.path.join(self.args.output_dir, checkpoint_folder)
+
+            self.save_model(output_dir)
+
+            if self.is_world_process_zero():
+                self._rotate_checkpoints(use_mtime=True)
+
+            torch.save(self.optimizer.state_dict(), os.path.join(output_dir, "optimizer.pt"))
+            torch.save(self.lr_scheduler.state_dict(), os.path.join(output_dir, "scheduler.pt"))
             if self.args.tpu_metrics_debug or self.args.debug:
                 logger.warning(
                     "You enabled PyTorch/XLA debug metrics but you don't have a TPU "
@@ -221,3 +229,99 @@ class MyTrainer(Trainer):
 
         logger.info("\n\nTraining completed. Do not forget to share your model on huggingface.co/models =)\n\n")
         return TrainOutput(self.global_step, tr_loss.item() / self.global_step)
+
+    def prediction_loop(
+            self, dataloader: DataLoader, description: str, prediction_loss_only: Optional[bool] = None
+    ) -> PredictionOutput:
+        """
+        Prediction/evaluation loop, shared by :obj:`Trainer.evaluate()` and :obj:`Trainer.predict()`.
+
+        Works both with or without labels.
+        """
+        if hasattr(self, "_prediction_loop"):
+            warnings.warn(
+                "The `_prediction_loop` method is deprecated and won't be called in a future version, define `prediction_loop` in your subclass.",
+                FutureWarning,
+            )
+            return self._prediction_loop(dataloader, description, prediction_loss_only=prediction_loss_only)
+
+        prediction_loss_only = (
+            prediction_loss_only if prediction_loss_only is not None else self.args.prediction_loss_only
+        )
+
+        assert not getattr(
+            self.model.config, "output_attentions", False
+        ), "The prediction loop does not work with `output_attentions=True`."
+        assert not getattr(
+            self.model.config, "output_hidden_states", False
+        ), "The prediction loop does not work with `output_hidden_states=True`."
+
+        model = self.model
+        # multi-gpu eval
+        if self.args.n_gpu > 1:
+            model = torch.nn.DataParallel(model)
+        else:
+            model = self.model
+        # Note: in torch.distributed mode, there's no point in wrapping the model
+        # inside a DistributedDataParallel as we'll be under `no_grad` anyways.
+
+        batch_size = dataloader.batch_size
+        logger.info("***** Running %s *****", description)
+        logger.info("  Num examples = %d", self.num_examples(dataloader))
+        logger.info("  Batch size = %d", batch_size)
+        eval_losses: List[float] = []
+        preds: torch.Tensor = None
+        label_ids: torch.Tensor = None
+        model.eval()
+
+        if self.args.past_index >= 0:
+            self._past = None
+
+        disable_tqdm = not self.is_local_process_zero() or self.args.disable_tqdm
+        for inputs in tqdm(dataloader, desc=description, disable=disable_tqdm):
+            loss, logits, labels = self.prediction_step(model, inputs, prediction_loss_only)
+            batch_size = inputs[list(inputs.keys())[0]].shape[0]
+            if loss is not None:
+                eval_losses.extend([loss] * batch_size)
+            if logits is not None:
+                preds = logits if preds is None else nested_concat(preds, logits, dim=0)
+            if labels is not None:
+                label_ids = labels if label_ids is None else nested_concat(label_ids, labels, dim=0)
+
+        if self.args.past_index and hasattr(self, "_past"):
+            # Clean the state at the end of the evaluation loop
+            delattr(self, "_past")
+
+        if self.args.local_rank != -1:
+            # In distributed mode, concatenate all results from all nodes:
+            if preds is not None:
+                preds = distributed_concat(preds, num_total_examples=self.num_examples(dataloader))
+            if label_ids is not None:
+                label_ids = distributed_concat(label_ids, num_total_examples=self.num_examples(dataloader))
+
+        # Finally, turn the aggregated tensors into numpy arrays.
+        if preds is not None:
+            preds = nested_numpify(preds)
+        if label_ids is not None:
+            label_ids = nested_numpify(label_ids)
+
+        if self.compute_metrics is not None and preds is not None and label_ids is not None:
+            metrics = self.compute_metrics(EvalPrediction(predictions=preds, label_ids=label_ids))
+        else:
+            metrics = {}
+        if len(eval_losses) > 0:
+            if self.args.local_rank != -1:
+                metrics["eval_loss"] = (
+                    distributed_broadcast_scalars(eval_losses, num_total_examples=self.num_examples(dataloader))
+                        .mean()
+                        .item()
+                )
+            else:
+                metrics["eval_loss"] = np.mean(eval_losses)
+
+        # Prefix all keys with eval_
+        for key in list(metrics.keys()):
+            if not key.startswith("eval_"):
+                metrics[f"eval_{key}"] = metrics.pop(key)
+
+        return PredictionOutput(predictions=preds, label_ids=label_ids, metrics=metrics)
