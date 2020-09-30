@@ -29,10 +29,10 @@ from transformers import (
     AutoTokenizer,
     EvalPrediction,
     HfArgumentParser,
-    Trainer,
     TrainingArguments,
     set_seed,
 )
+from trainer import MyTrainer
 from utils_multiple_choice import MultipleChoiceDataset, Split, processors
 
 
@@ -181,7 +181,7 @@ def main():
         return {"acc": simple_accuracy(preds, p.label_ids)}
 
     # Initialize our Trainer
-    trainer = Trainer(
+    trainer = MyTrainer(
         model=model,
         args=training_args,
         train_dataset=train_dataset,
@@ -190,7 +190,9 @@ def main():
     )
 
     # Training
+
     if training_args.do_train:
+
         trainer.train(
             model_path=model_args.model_name_or_path if os.path.isdir(model_args.model_name_or_path) else None
         )
